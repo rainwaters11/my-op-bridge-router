@@ -1,116 +1,66 @@
-# Swap + Bridge Router
+# Uniswap v4 Swap & Bridge Router (Optimism)
 
-End users (EOAs) cannot call Uniswap v4 PoolManager directly.
+## Project Summary
+This repository contains a custom Uniswap v4 Swap Router integrated directly with Optimism's `L1StandardBridge`. Designed as a comprehensive cross-chain execution environment, this contract allows users to seamlessly swap assets via the v4 `PoolManager` on Layer 1 and optionally bridge the resulting output tokens to Layer 2 (Optimism) in a single transaction lifecycle. 
 
-In our tests, we've been routing calls through various different router contracts.
+This serves as a simplified proof-of-concept for cross-chain liquidity execution (similar to Squid Router), demonstrating how to take assets on Chain 1, execute a swap, and immediately bridge the output to Chain 2.
 
--> PoolSwapTest
--> PoolModifyLiquidityTest
+## The Job of the Router
+End users (EOAs) cannot call the Uniswap v4 `PoolManager` directly. While standard operations typically route through the `UniversalRouter` (for swaps) or the `NFT Position Manager` (for liquidity modification), this custom router specifically handles:
 
-Swapping => UniversalRouter
-Modifying Liquidity => NFT Position Manager (LP NFTs to end users)
+1. **Routing:** Properly routing the user's action and parameters over the `PoolManager`.
+2. **Settlement:** Settling delta balances with the `PoolManager` post-swap.
+3. **Execution/Bridging:** Delivering output tokens directly to the user on L1, or bridging them to Optimism if the user signaled that intent via the `SwapSettings` struct.
 
-We're gonna build our own swap router.
+## Mechanism Design & Constraints
+Not all tokens are eligible to be bridged from L1 to L2 natively. 
 
-## Idea
+To manage this, the router maintains an `ownerOnly` mapping called `l1ToL2TokenAddresses` (e.g., mapping L1 USDC `0xabc...` to L2 USDC `0xxyz...`). If a user requests a swap where the output token is *not* registered in this mapping, the transaction reverts to prevent stranded assets.
 
-We're going to build a swap router that integrates with Optimism's native bridge contracts.
+> **Note:** On Sepolia, the native bridge currently only officially supports native `ETH` and `OUTb` (Optimism Useless Token Bridgeable).
 
-User requests a swap for A to B, and they can optionally choose to have B bridged over to Optimism instead of getting it on L1.
+## Testing Architecture
+Cross-chain testing presents unique challenges. When a user initiates a bridge transaction on the ETH L1, it emits an event. Off-chain processors (Optimism nodes) listen for this event, validate it, and subsequently trigger a transaction on the L2 (OP Sepolia) to deliver the funds. 
 
-Simplified proof-of-concept for building something like Squid Router essentially.
+Because we cannot easily replicate this off-chain node infrastructure locally, our testing strategy is split into two parts:
 
-One of two things:
+### 1. Local Network Forking
+Using Foundry's network forking capabilities, we fork the Sepolia testnet locally. This allows us to deploy our v4-related contracts and conduct swaps through our router against real network state without needing to deploy our own `L1StandardBridge` mocks.
 
-1. Take money on chain 1, swap it, bridge output tokens to Chain 2
-2. OR, take money on chain 1, bridge to chain 2, and swap over there
+### 2. Event Emission Validation
+Instead of waiting for an L2 execution locally, our test suite rigorously verifies that the exact expected events are emitted from the L1 contracts. 
 
-> NOTE: Some of the code we're gonna write today is pretty Optimism-specific stuff. We're gonna skim over that specific knowledge, and focus mostly on the router itself.
+In the EVM, events are structured as follows:
+* **Topic 0:** `keccak256(event signature)` – Identifies *which* event is being emitted.
+* **Topic 1-3:** Optional topics utilized if the event contains `indexed` parameters (enabling easy filtering for the off-chain nodes).
+* **Data:** The ABI-encoded version of all remaining non-indexed information.
 
-## Job of a Router
+Our Foundry tests utilize `vm.expectEmit(checkTopic1, checkTopic2, checkTopic3, checkData)`. (Note: Foundry always checks Topic 0 implicitly). By ensuring the `ERC20DepositInitiated` and `SentMessage` events are perfectly constructed, we can trust the off-chain Optimism nodes will process the transaction.
 
-1. Route the user action over the PM properly (swap parameters)
-2. Settle balances with the pool manager at the end
-3. Send output tokens to user or bridge them to Optimism if user signaled they want to do that (and if it is possible)
+### Live Verification
+Alongside the local tests, a deployment script is included to interact directly with the Sepolia testnet. This allows you to broadcast a public transaction and manually verify the corresponding Optimism execution on a block explorer after the standard 10-20 minute bridging delay.
 
-## Mechanism Design
+## Installation & Usage
 
-Not all tokens are possible to bridge from L1 to L2
+### Prerequisites
+You will need [Foundry](https://getfoundry.sh/) installed to compile and test this project. 
 
-in our contract, we'll maintain a mapping called `l1ToL2TokenAddresses`
+```bash
+curl -L [https://foundry.paradigm.xyz](https://foundry.paradigm.xyz) | bash
+foundryup
 
-USDC on L1 -> 0xabc...
-USDC on L2 -> 0xxyz...
+Build & Test
+Clone the repository and install the required submodules (Uniswap v4-periphery and Optimism contracts):
 
-If the output token of the swap being requested is NOT part of this mapping, then we cannot bridge to Optimism
+Bash
+git clone [https://github.com/rainwaters11/my-op-bridge-router.git](https://github.com/rainwaters11/my-op-bridge-router.git)
+cd my-op-bridge-router
+forge install
+Compile the smart contracts:
 
-adding a new key-value pair to this mapping will be an `ownerOnly` function in our case
+Bash
+forge build
+Run the local test suite against the Sepolia fork to verify the routing logic and bridge event emissions:
 
-Squid Router: they integrate with Axelar's bridge so they basically just use Axelar's mapping of token addresses and only work with tokens that Axelar supports bridging between a given src and dest chain
-
----
-
-On Sepolia, particularly, there's only two tokens "officially" supported to bridge through the native bridge
-
-1. ETH (native ETH)
-2. OUTb (Optimism Useless Token Bridgeable)
-
-## What can we actually test locally
-
-Foundry has a cool feature called network forking.
-
-It allows us to "fork" any public chain locally and run sort of a little replica of it on your computer
-
-we're not gonna deploy our own L1StandardBridge or any of the other Optimism contracts
-
-we're gonna fork the Sepolia testnet, deploy our v4-related contracts, conduct swaps through our router to v4
-
-BUT - a problem with forked networks:
-
----
-
-Alice intiiates a bridge txn on ETH L1
--> emit some sort of event from the contract
-
-Offchain processor (optimism nodes) are listening for that event
--> they will do their thing and make sure its valid
-
-offchain processor will trigger a transaction on the L2 (OP Sepolia)
--> funds will be sent to the recipietn addres
-
----
-
-we're gonna write a test that runs locally and tests the events being emitted are valid and as expected
-
----
-
-we're gonna also write a script that will actualyl interact with sepolia and send a public txn that you can verify after 10-20 minutes that an optimism txn was also created
-
-## Events
-
-1. Topic0
-
-2. Topic1 (?)
-3. Topic2 (?)
-4. Topic3 (?)
-
-5. Data = abi.encoded version of all the remaining inforamtion
-
-Topic0 = keccak256(event signature)
-=> WHICH event is being emitted
-
-`indexed` parameter => easy filtering of events on the node side
-
-Topic1 is optional, and exists if there is at least 1 `indexed` parameter in the event
-
-Topic2 is optional, exists if theres a second `indexed` parameter in the event
-
-Topic3 is optional, exists if theres a third `indexed` parameter in the event
-
-Data is all the other stuff abi encoded together
-
----
-
-`expectEmit` will ALWAYS check `Topic0`
-
-(`checkTopic1`, `checkTopic2`, `checkTopic3`, `checkData`)
+Bash
+forge test -vvv
